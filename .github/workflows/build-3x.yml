@@ -1,0 +1,155 @@
+name: Build Dopamine 3.x
+
+on:
+  schedule:
+    # Every 6 hours. GitHub may delay scheduled runs under load.
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main, master, 3.x]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dopamine-3x-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      short: ${{ steps.upstream.outputs.short }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Resolve upstream 3.x HEAD
+        id: upstream
+        run: |
+          set -euo pipefail
+          SHA=$(git ls-remote https://github.com/roothide/Dopamine-roothide.git refs/heads/3.x | awk '{print $1}')
+          test -n "$SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: upstream-${{ steps.upstream.outputs.short }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream ${TAG#upstream-} is already built."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commit ${TAG#upstream-}; building."
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - name: Xcode setup
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Checkout upstream 3.x
+        uses: actions/checkout@v4
+        with:
+          repository: roothide/Dopamine-roothide
+          ref: ${{ needs.check.outputs.sha }}
+          submodules: recursive
+
+      - name: Install Procursus
+        uses: dhinakg/procursus-action@main
+        with:
+          packages: ldid findutils sed coreutils make
+
+      - name: Install GNU Make
+        run: |
+          brew install make
+          echo "PATH=$(brew --prefix make)/libexec/gnubin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install THEOS
+        run: |
+          set -euxo pipefail
+          export BASEDIR="$(pwd)"
+          export THEOS="${BASEDIR}/theos"
+          mkdir -p "$THEOS"
+          curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos > install-theos.sh
+          gsed -E "/^\s*get_theos\s*$/,+1 s/^(\s*)(get_sdks)\s*$/\1mkdir -p \${THEOS}\/sdks\n\1touch \${THEOS}\/sdks\/sdk\n\1\2/g" -i install-theos.sh
+          bash install-theos.sh
+          curl -L https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          gunzip "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          tar -xf "$THEOS/sdks/iPhoneOS16.5.sdk.tar" -C "$THEOS/sdks"
+          rm "$THEOS/sdks/iPhoneOS16.5.sdk.tar"
+
+      - name: Build and install trustcache
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/CRKatri/trustcache
+          cd trustcache
+          export CFLAGS="$CFLAGS -I$(brew --prefix openssl)/include -arch arm64"
+          export LDFLAGS="$LDFLAGS -L$(brew --prefix openssl)/lib -arch arm64"
+          gmake -j$(sysctl -n hw.logicalcpu) OPENSSL=1
+          sudo cp trustcache /opt/procursus/bin/
+
+      - name: Install libarchive
+        run: brew install libarchive
+
+      - name: Build IPA and TIPA
+        run: |
+          set -euxo pipefail
+          export BASEDIR="$(pwd)"
+          export THEOS="${BASEDIR}/theos"
+          plutil -insert items.4 -xml "<dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>BUILDER</string></dict>" ./Application/Dopamine/UI/Settings/Credits.plist
+          plutil -insert items.5 -xml "<dict><key>cell</key><string>PSGroupCell</string><key>headerCellClass</key><string>DOCreditsCell</string><key>names</key><array><dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict></array></dict>" ./Application/Dopamine/UI/Settings/Credits.plist
+          gmake -j$(sysctl -n hw.logicalcpu) NIGHTLY=1
+          VERSION="("$(cat ./BaseBin/_external/basebin/.version)-$(cat ./BaseBin/_external/basebin/.version-roothide)-$(git rev-parse --short HEAD)")"-$(TZ=UTC git show -s --date=format-local:'%Y.%m.%d-%Z-%H.%M.%S' --format='%cd' HEAD)
+          mv ./Application/Dopamine.ipa "./Application/roothide-Dopamine-${VERSION}.ipa"
+          mv ./Application/Dopamine.tipa "./Application/roothide-Dopamine-${VERSION}.tipa"
+          ls -lh ./Application/*.ipa ./Application/*.tipa
+
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd Application
+          shasum -a 256 roothide-Dopamine-*.ipa roothide-Dopamine-*.tipa > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dopamine-3x-${{ needs.check.outputs.short }}
+          path: |
+            Application/roothide-Dopamine-*.ipa
+            Application/roothide-Dopamine-*.tipa
+            Application/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: upstream-${{ needs.check.outputs.short }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(
+            ./Application/roothide-Dopamine-*.ipa
+            ./Application/roothide-Dopamine-*.tipa
+            ./Application/SHA256SUMS.txt
+          )
+          test "${#files[@]}" -eq 3
+          gh release create "$TAG" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Dopamine 3.x (${TAG#upstream-})" \
+            --notes "Automated build of [roothide/Dopamine-roothide@${UPSTREAM_SHA:0:8}](https://github.com/roothide/Dopamine-roothide/commit/${UPSTREAM_SHA}) on branch 3.x.
+
+          The IPA/TIPA are unsigned, exactly as produced by the upstream build. Sign them for your device or install with TrollStore."
